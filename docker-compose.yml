@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  stream-backend:
+    build: .
+    container_name: vidfast_stream_server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
