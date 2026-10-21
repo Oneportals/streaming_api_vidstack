@@ -659,23 +659,28 @@ def pick_playable_stream(sources: list, codec: str = None, transcode: str = None
 @app.api_route("/stream/movie/{movie_id}", methods=["GET", "HEAD"])
 async def direct_stream_redirect(request: Request, movie_id: str, lang: str = None, codec: str = None, transcode: str = None, raw: str = None):
     try:
+        if movie_id == "movie" and lang:
+            actual_id = lang
+            target_lang = request.query_params.get("lang")
+        else:
+            actual_id = movie_id
+            target_lang = lang or request.query_params.get("lang")
         accept_hdr = request.headers.get("accept", "").lower()
         ua = request.headers.get("user-agent", "").lower()
-        target_lang = lang or request.query_params.get("lang")
 
         # 1. If JSON requested or query param ?json=1: return direct API JSON
         if "application/json" in accept_hdr or request.query_params.get("json"):
-            source_data = await api_source_for_videojs(request, movie_id)
+            source_data = await api_source_for_videojs(request, actual_id)
             if isinstance(source_data, dict) and source_data.get("sources"):
                 stream_url = pick_playable_stream(source_data["sources"], codec, transcode)
                 base = str(request.base_url).rstrip("/")
                 return JSONResponse({
                     "status": "success",
-                    "media_id": movie_id,
+                    "media_id": actual_id,
                     "language": target_lang or "english",
                     "direct_stream_url": stream_url,
-                    "stream_embed_url": f"{base}/stream/{movie_id}" + (f"/{target_lang}" if target_lang else ""),
-                    "player_url": f"{base}/watch/{movie_id}" + (f"?lang={target_lang}" if target_lang else ""),
+                    "stream_embed_url": f"{base}/stream/{actual_id}" + (f"/{target_lang}" if target_lang else ""),
+                    "player_url": f"{base}/watch/{actual_id}" + (f"?lang={target_lang}" if target_lang else ""),
                     "sources": source_data["sources"],
                     "subtitles": source_data.get("tracks", [])
                 })
@@ -685,10 +690,10 @@ async def direct_stream_redirect(request: Request, movie_id: str, lang: str = No
         # Serve our 100% Native Custom Cinema Player with pre-selected language and ZERO IFRAMES!
         if "text/html" in accept_hdr and not raw:
             lang_param = f"&lang={urllib.parse.quote(target_lang)}" if target_lang else ""
-            return RedirectResponse(url=f"/embed/movie/{movie_id}?autoplay=1{lang_param}", status_code=307)
+            return RedirectResponse(url=f"/embed/movie/{actual_id}?autoplay=1{lang_param}", status_code=307)
 
         # 3. If requested directly as video stream (e.g. <video src="...">, VLC, ffmpeg, or raw=1):
-        source_data = await api_source_for_videojs(request, movie_id)
+        source_data = await api_source_for_videojs(request, actual_id)
         if isinstance(source_data, dict) and source_data.get("sources"):
             is_firefox = "firefox" in ua
             if is_firefox and not codec:
@@ -748,7 +753,7 @@ async def direct_stream_tv_redirect(request: Request, tv_id: str, season: int, e
 @app.get("/api/stream/{movie_id}")
 async def api_direct_stream_json(request: Request, movie_id: str, lang: str = None):
     target_lang = lang or request.query_params.get("lang")
-    source_data = await api_source_for_videojs(request, movie_id)
+    source_data = await api_source_for_videojs(request, actual_id)
     if isinstance(source_data, dict) and source_data.get("sources"):
         stream_url = pick_playable_stream(source_data["sources"])
         base = str(request.base_url).rstrip("/")
@@ -756,11 +761,11 @@ async def api_direct_stream_json(request: Request, movie_id: str, lang: str = No
         return {
             "status": "success",
             "type": "movie",
-            "media_id": movie_id,
+            "media_id": actual_id,
             "language": target_lang or "english",
             "direct_stream_url": stream_url,
-            "stream_embed_url": f"{base}/stream/{movie_id}" + (f"/{target_lang}" if target_lang else ""),
-            "player_url": f"{base}/watch/{movie_id}" + (f"?lang={target_lang}" if target_lang else ""),
+            "stream_embed_url": f"{base}/stream/{actual_id}" + (f"/{target_lang}" if target_lang else ""),
+            "player_url": f"{base}/watch/{actual_id}" + (f"?lang={target_lang}" if target_lang else ""),
             "active_subtitle": matching_sub,
             "all_sources": source_data["sources"],
             "all_subtitles": source_data.get("tracks", [])
@@ -1760,9 +1765,14 @@ EMBED_HTML_TEMPLATE = """<!DOCTYPE html>
 @app.get("/embed/{movie_id}", response_class=HTMLResponse)
 @app.get("/embed/{movie_id}/{lang}", response_class=HTMLResponse)
 async def embed_movie(request: Request, movie_id: str, lang: str = None):
-    target_lang = lang or request.query_params.get("lang") or ""
+    if movie_id == "movie" and lang:
+        actual_id = lang
+        target_lang = request.query_params.get("lang") or ""
+    else:
+        actual_id = movie_id
+        target_lang = lang or request.query_params.get("lang") or ""
     html = EMBED_HTML_TEMPLATE.replace("__MEDIA_TYPE__", "movie")\
-                               .replace("__MEDIA_ID__", movie_id)\
+                               .replace("__MEDIA_ID__", actual_id)\
                                .replace("__SEASON__", "1")\
                                .replace("__EPISODE__", "1")\
                                .replace("__TARGET_LANG__", target_lang)
@@ -3012,8 +3022,12 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
 @app.get("/player/{movie_id}", response_class=HTMLResponse)
 @app.get("/player/{movie_id}/{lang}", response_class=HTMLResponse)
 async def watch_movie_player(request: Request, movie_id: str = None, id: str = None, lang: str = None):
-    target_id = movie_id or id or request.query_params.get("id") or "1148365"
-    target_lang = lang or request.query_params.get("lang") or ""
+    if movie_id == "movie" and lang:
+        target_id = lang
+        target_lang = request.query_params.get("lang") or ""
+    else:
+        target_id = movie_id or id or request.query_params.get("id") or "1148365"
+        target_lang = lang or request.query_params.get("lang") or ""
     html = PLAYER_HTML_TEMPLATE.replace("__MEDIA_TYPE__", "movie")\
                                .replace("__TARGET_ID__", target_id)\
                                .replace("__TARGET_SEASON__", "1")\
