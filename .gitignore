@@ -36,4 +36,5 @@ scratch/
 *.jpg
 *.png
 *.txt
+!requirements.txt
 *.db

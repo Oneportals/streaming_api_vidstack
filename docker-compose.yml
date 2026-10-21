@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   stream-backend:
-    build: .
+    image: ghcr.io/oneportals/streaming_api_vidstack:latest
     container_name: vidfast_stream_server
     restart: unless-stopped
     ports:

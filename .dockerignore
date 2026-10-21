@@ -15,4 +15,4 @@ scratch/
 *.zip
 *.jpg
 *.png
-*.txt
+!requirements.txt
