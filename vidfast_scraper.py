@@ -1169,9 +1169,9 @@ async def proxy_m3u8(request: Request, url: str, referer: str = None, origin: st
                 headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
             )
 
-        stream_url = urllib.parse.unquote(url)
-        ref = urllib.parse.unquote(referer) if referer else None
-        orig = urllib.parse.unquote(origin) if origin else None
+        stream_url = urllib.parse.unquote(url) if "%" in url else url
+        ref = urllib.parse.unquote(referer) if (referer and "%" in referer) else referer
+        orig = urllib.parse.unquote(origin) if (origin and "%" in origin) else origin
         headers = get_upstream_headers(stream_url, ref, orig)
         
         try:
@@ -1236,9 +1236,9 @@ async def proxy_m3u8(request: Request, url: str, referer: str = None, origin: st
 @app.api_route("/proxy/segment", methods=["GET", "HEAD"])
 async def proxy_segment(request: Request, url: str, referer: str = None, origin: str = None):
     try:
-        segment_url = urllib.parse.unquote(url)
-        ref = urllib.parse.unquote(referer) if referer else None
-        orig = urllib.parse.unquote(origin) if origin else None
+        segment_url = urllib.parse.unquote(url) if "%" in url else url
+        ref = urllib.parse.unquote(referer) if (referer and "%" in referer) else referer
+        orig = urllib.parse.unquote(origin) if (origin and "%" in origin) else origin
         headers = get_upstream_headers(segment_url, ref, orig)
         
         client_range = request.headers.get("Range")
@@ -1299,9 +1299,9 @@ async def proxy_segment(request: Request, url: str, referer: str = None, origin:
 @app.api_route("/proxy/h264", methods=["GET", "HEAD"])
 async def proxy_h264(request: Request, url: str, referer: str = None, origin: str = None, ss: float = 0.0):
     try:
-        segment_url = urllib.parse.unquote(url)
-        ref = urllib.parse.unquote(referer) if referer else None
-        orig = urllib.parse.unquote(origin) if origin else None
+        segment_url = urllib.parse.unquote(url) if "%" in url else url
+        ref = urllib.parse.unquote(referer) if (referer and "%" in referer) else referer
+        orig = urllib.parse.unquote(origin) if (origin and "%" in origin) else origin
 
         if request.method == "HEAD":
             return Response(
@@ -3391,8 +3391,20 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
       if (!source) return;
 
       qualitySelect.value = index;
-      qualitySelect2.value = index;
+      if (typeof qualitySelect2 !== 'undefined' && qualitySelect2) qualitySelect2.value = index;
       baseOffset = 0;
+      if (typeof serverSelect !== 'undefined' && serverSelect) {
+        if (source.server === '3' || source.isMultiAudio || (source.label && source.label.includes('Multi-Audio'))) {
+          serverSelect.value = '3';
+          if (typeof serverSelect2 !== 'undefined' && serverSelect2) serverSelect2.value = '3';
+        } else if (source.isMirror || (source.label && source.label.includes('Mirror'))) {
+          serverSelect.value = '2';
+          if (typeof serverSelect2 !== 'undefined' && serverSelect2) serverSelect2.value = '2';
+        } else {
+          serverSelect.value = '1';
+          if (typeof serverSelect2 !== 'undefined' && serverSelect2) serverSelect2.value = '1';
+        }
+      }
 
       if (hlsInstance) {
         hlsInstance.destroy();
