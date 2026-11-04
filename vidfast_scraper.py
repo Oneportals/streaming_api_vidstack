@@ -925,6 +925,34 @@ def build_sources_tracks_servers(stream: dict, base_server: str, media_type: str
 
     return sources, tracks, servers, total_dur
 
+@app.get("/api/debug/{movie_id}")
+async def api_debug(movie_id: str):
+    res = {
+        "has_nacl": nacl is not None,
+        "has_curl_cffi": HAS_CURL_CFFI,
+    }
+    try:
+        res["tmdb_meta"] = get_tmdb_metadata(movie_id)
+    except Exception as e:
+        res["tmdb_meta_error"] = str(e)
+    try:
+        res["netmirror_base"] = resolve_netmirror_api_base()
+    except Exception as e:
+        res["netmirror_base_error"] = str(e)
+    try:
+        res["netmirror"] = get_netmirror_direct_stream(movie_id)
+    except Exception as e:
+        res["netmirror_error"] = str(e)
+    try:
+        res["vidsrc"] = get_vidsrc_direct_stream(movie_id)
+    except Exception as e:
+        res["vidsrc_error"] = str(e)
+    try:
+        res["vidlink"] = await get_movie(movie_id)
+    except Exception as e:
+        res["vidlink_error"] = str(e)
+    return res
+
 @app.get("/api/source/{movie_id}")
 async def api_source_for_videojs(request: Request, movie_id: str):
     base_server = get_base_url(request)
