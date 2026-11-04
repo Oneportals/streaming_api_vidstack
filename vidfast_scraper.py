@@ -18,13 +18,35 @@ import concurrent.futures
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import nacl.secret
-from curl_cffi import requests as curl_requests
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+try:
+    import nacl.secret
+except ImportError:
+    nacl = None
+
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    import requests as curl_requests
+    HAS_CURL_CFFI = False
+
+def safe_curl_get(url, **kwargs):
+    if not HAS_CURL_CFFI:
+        kwargs.pop("impersonate", None)
+        return requests.get(url, **kwargs)
+    try:
+        return safe_curl_get(url, **kwargs)
+    except TypeError:
+        kwargs.pop("impersonate", None)
+        return requests.get(url, **kwargs)
+
 import requests
 import uvicorn
 
 app = FastAPI(title="VidFast & VidLink Universal Backend", docs_url=None, redoc_url=None)
 
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,9 +55,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def get_base_url(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto")
+    if not proto:
+        proto = request.headers.get("x-forwarded-scheme")
+    if not proto and request.headers.get("x-forwarded-ssl") == "on":
+        proto = "https"
+    if not proto and request.headers.get("cf-visitor") and '"scheme":"https"' in request.headers.get("cf-visitor", ""):
+        proto = "https"
+    if not proto:
+        proto = request.url.scheme or "http"
+    proto = proto.split(",")[0].strip()
+
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if host:
+        host = host.split(",")[0].strip()
+    else:
+        host = request.url.netloc
+
+    return f"{proto}://{host}".rstrip("/")
+
+
 KEY_HEX = "c75136c5668bbfe65a7ecad431a745db68b5f381555b38d8f6c699449cf11fcd"
 KEY = bytes.fromhex(KEY_HEX)
-BOX = nacl.secret.SecretBox(KEY)
+BOX = nacl.secret.SecretBox(KEY) if nacl else None
 NONCE = bytes(24)
 
 VIDLINK_HEADERS = {
@@ -65,6 +108,8 @@ INDIAN_LANGUAGES = [
 session = requests.Session()
 
 def encrypt_token(media_id: str) -> str:
+    if not BOX:
+        return ""
     timestamp = int(time.time() + 480)
     message = str(media_id).encode("utf-8") + struct.pack(">Q", timestamp)
     encrypted = BOX.encrypt(message, NONCE)
@@ -77,6 +122,20 @@ def get_upstream_headers(target_url: str, referer: str = None, origin: str = Non
         headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         headers["Referer"] = "https://vidfast.pro/"
         headers["Origin"] = "https://vidfast.pro"
+    elif "freecdn" in target_url or "imgcdn" in target_url or "net52" in (referer or "") or "netmirror" in target_url:
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        headers["Referer"] = referer or "https://net52.cc/"
+        headers["Origin"] = origin or "https://net52.cc"
+    elif "novahd" in (referer or "") or "novahd" in target_url or "edgemaster.site" in target_url:
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        headers["Referer"] = referer or "https://novahd.cc/"
+        headers["Origin"] = origin or "https://novahd.cc"
+    elif "totu.me" in target_url or "hubcloud" in target_url:
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        if referer:
+            headers["Referer"] = referer
+        if origin:
+            headers["Origin"] = origin
     elif "filmboom" in (referer or "") or "bcdnxw" in target_url:
         headers["Referer"] = referer or "https://filmboom.top/"
         headers["Origin"] = origin or "https://filmboom.top"
@@ -174,7 +233,7 @@ async def get_movie(movie_id: str):
     token = encrypt_token(movie_id)
     url = f"https://vidlink.pro/api/b/movie/{token}?multiLang=1"
     try:
-        response = curl_requests.get(url, headers=VIDLINK_HEADERS, impersonate="chrome110", timeout=10)
+        response = safe_curl_get(url, headers=VIDLINK_HEADERS, impersonate="chrome110", timeout=10)
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail="Host server connection rejected.")
         return response.json()
@@ -186,7 +245,7 @@ async def get_tv(tv_id: str, season: int, episode: int):
     token = encrypt_token(tv_id)
     url = f"https://vidlink.pro/api/b/tv/{token}/{season}/{episode}?multiLang=1"
     try:
-        response = curl_requests.get(url, headers=VIDLINK_HEADERS, impersonate="chrome110", timeout=10)
+        response = safe_curl_get(url, headers=VIDLINK_HEADERS, impersonate="chrome110", timeout=10)
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail="Host segment server rejected connection.")
         return response.json()
@@ -252,7 +311,7 @@ def build_all_subtitles(captions: list, base_server: str) -> list:
 
 @app.get("/api/subtitles/{movie_id}")
 async def get_movie_subtitles(request: Request, movie_id: str):
-    base_server = str(request.base_url).rstrip("/")
+    base_server = get_base_url(request)
     try:
         data = await get_movie(movie_id)
         stream = data.get("stream") if data else None
@@ -269,7 +328,7 @@ async def get_movie_subtitles(request: Request, movie_id: str):
 
 @app.get("/api/subtitles/tv/{tv_id}/{season}/{episode}")
 async def get_tv_subtitles(request: Request, tv_id: str, season: int, episode: int):
-    base_server = str(request.base_url).rstrip("/")
+    base_server = get_base_url(request)
     try:
         data = await get_tv(tv_id, season, episode)
         stream = data.get("stream") if data else None
@@ -447,6 +506,246 @@ class MultiembedHunterDecoder:
         except Exception:
             return []
 
+
+TMDB_KEYS = [
+    "439c478a771f35c05022f9feabcca01c",
+    "1865f43a0549ca50d341dd9ab8b29f49",
+    "8265bd1679663a7ea12ac168da84d2e8",
+    "e49339e830e014e414c2b9a71b2d4f82"
+]
+
+NEWTV_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "X-Requested-With": "NetmirrorNewTV v1.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0 /OS.GatuNewTV v1.0",
+    "Accept": "application/json, text/plain, */*"
+}
+
+DISCOVERY_DOMAINS = [
+    "https://mobiledetects.com",
+    "https://mobiledetect.app",
+    "https://mobidetect.art",
+    "https://mobidetect.cc",
+    "https://mobidetect.vip",
+    "https://mobidetect.xyz"
+]
+
+_NETMIRROR_API_BASE = "https://tv.imgcdn.kim"
+_NETMIRROR_RESOLVE_TIME = 0
+
+def resolve_netmirror_api_base() -> str:
+    global _NETMIRROR_API_BASE, _NETMIRROR_RESOLVE_TIME
+    now = time.time()
+    if _NETMIRROR_API_BASE and (now - _NETMIRROR_RESOLVE_TIME < 3600):
+        return _NETMIRROR_API_BASE
+    for d in DISCOVERY_DOMAINS:
+        try:
+            r = safe_curl_get(f"{d}/checknewtv.php", headers=NEWTV_HEADERS, impersonate="chrome120", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                if "token_hash" in data:
+                    decoded = base64.b64decode(data["token_hash"]).decode("utf-8").strip()
+                    if decoded.startswith("http"):
+                        _NETMIRROR_API_BASE = decoded
+                        _NETMIRROR_RESOLVE_TIME = now
+                        return _NETMIRROR_API_BASE
+        except Exception:
+            pass
+    return _NETMIRROR_API_BASE or "https://tv.imgcdn.kim"
+
+def get_tmdb_metadata(media_id: str, is_tv: bool = False) -> tuple:
+    endpoint = "tv" if is_tv else "movie"
+    for key in TMDB_KEYS:
+        try:
+            url = f"https://api.tmdb.org/3/{endpoint}/{media_id}?api_key={key}"
+            r = safe_curl_get(url, impersonate="chrome120", timeout=4)
+            if r.status_code == 200:
+                data = r.json()
+                title = data.get("title") or data.get("name") or data.get("original_title") or ""
+                release_date = data.get("release_date") or data.get("first_air_date") or ""
+                year = release_date.split("-")[0] if release_date else ""
+                if title:
+                    return title, year
+        except Exception:
+            pass
+    return "", ""
+
+def get_netmirror_direct_stream(media_id: str, is_tv: bool = False, season: int = 1, episode: int = 1) -> dict:
+    try:
+        title, year = get_tmdb_metadata(media_id, is_tv)
+        if not title:
+            title = str(media_id)
+        api_base = resolve_netmirror_api_base()
+        clean_target = re.sub(r'[^a-zA-Z0-9]+', '', title).lower()
+        
+        ott_list = ["nf", "pv", "hs"]
+        for ott in ott_list:
+            try:
+                search_url = f"{api_base}/newtv/search.php?s={urllib.parse.quote(title)}&t={int(time.time()*1000)}"
+                h = dict(NEWTV_HEADERS)
+                h["Ott"] = ott
+                sr = safe_curl_get(search_url, headers=h, impersonate="chrome120", timeout=4)
+                if sr.status_code != 200:
+                    continue
+                sdata = sr.json()
+                results = sdata.get("searchResult", [])
+                if not results or not isinstance(results, list):
+                    continue
+                
+                match_item = None
+                for r in results:
+                    t_norm = re.sub(r'[^a-zA-Z0-9]+', '', r.get("t", "")).lower()
+                    if t_norm == clean_target or clean_target in t_norm:
+                        match_item = r
+                        break
+                if not match_item and len(results) == 1:
+                    match_item = results[0]
+                if not match_item or not match_item.get("id"):
+                    continue
+                
+                item_id = match_item["id"]
+                if not is_tv:
+                    player_url = f"{api_base}/newtv/player.php?id={item_id}"
+                    pr = safe_curl_get(player_url, headers=h, impersonate="chrome120", timeout=5)
+                    if pr.status_code == 200:
+                        pdata = pr.json()
+                        vlink = pdata.get("video_link")
+                        if vlink and ".m3u8" in vlink:
+                            return {
+                                "status": "success",
+                                "stream_url": vlink,
+                                "referer": pdata.get("referer", "https://net52.cc"),
+                                "origin": "https://net52.cc",
+                                "provider": f"NetMirror Multi-Audio ({ott.upper()})"
+                            }
+                else:
+                    post_url = f"{api_base}/newtv/post.php?id={item_id}"
+                    post_r = safe_curl_get(post_url, headers=h, impersonate="chrome120", timeout=5)
+                    if post_r.status_code == 200:
+                        post_data = post_r.json()
+                        seasons = post_data.get("season") or []
+                        target_season = None
+                        for s in seasons:
+                            s_str = str(s.get("s", "")).lower()
+                            if f"season {season}" in s_str or f"s{season}" in s_str or s_str == str(season):
+                                target_season = s
+                                break
+                        if not target_season and season <= len(seasons):
+                            target_season = seasons[season - 1]
+                        
+                        if target_season:
+                            ep_url = f"{api_base}/newtv/episodes.php?id={target_season.get('id')}"
+                            ep_r = safe_curl_get(ep_url, headers=h, impersonate="chrome120", timeout=5)
+                            if ep_r.status_code == 200:
+                                ep_data = ep_r.json()
+                                episodes_list = ep_data.get("episodes") or []
+                                match_ep = None
+                                for e in episodes_list:
+                                    if str(e.get("ep")) == str(episode):
+                                        match_ep = e
+                                        break
+                                if not match_ep and episode <= len(episodes_list):
+                                    match_ep = episodes_list[episode - 1]
+                                if match_ep and match_ep.get("id"):
+                                    ep_player_url = f"{api_base}/newtv/player.php?id={match_ep.get('id')}"
+                                    epr = safe_curl_get(ep_player_url, headers=h, impersonate="chrome120", timeout=5)
+                                    if epr.status_code == 200:
+                                        ep_pdata = epr.json()
+                                        vlink = ep_pdata.get("video_link")
+                                        if vlink and ".m3u8" in vlink:
+                                            return {
+                                                "status": "success",
+                                                "stream_url": vlink,
+                                                "referer": ep_pdata.get("referer", "https://net52.cc"),
+                                                "origin": "https://net52.cc",
+                                                "provider": f"NetMirror Multi-Audio ({ott.upper()})"
+                                            }
+            except Exception as ott_e:
+                continue
+    except Exception as e:
+        print(f"[WARN] NetMirror stream scrape error: {e}")
+    return {}
+
+def get_novahd_direct_stream(media_id: str, is_tv: bool = False, season: int = 1, episode: int = 1) -> dict:
+    url = f"https://novahd.cc/watch/tv/{media_id}/{season}/{episode}" if is_tv else f"https://novahd.cc/watch/m/{media_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://novahd.cc/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+    }
+    try:
+        r = safe_curl_get(url, headers=headers, impersonate="chrome120", timeout=8)
+        if r.status_code == 200:
+            html = r.text
+            next_data_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+            if next_data_match:
+                try:
+                    import json
+                    data = json.loads(next_data_match.group(1))
+                    page_props = data.get("props", {}).get("pageProps", {})
+                    for key in ["stream", "sources", "playlist", "source", "videoUrl"]:
+                        val = page_props.get(key)
+                        if isinstance(val, str) and (".m3u8" in val or ".mp4" in val):
+                            return {"status": "success", "stream_url": val, "referer": "https://novahd.cc/", "origin": "https://novahd.cc"}
+                        elif isinstance(val, list) and len(val) > 0:
+                            first = val[0]
+                            if isinstance(first, dict) and first.get("url"):
+                                return {"status": "success", "stream_url": first["url"], "referer": "https://novahd.cc/", "origin": "https://novahd.cc"}
+                            elif isinstance(first, str):
+                                return {"status": "success", "stream_url": first, "referer": "https://novahd.cc/", "origin": "https://novahd.cc"}
+                except Exception:
+                    pass
+            m3u8_matches = re.findall(r'https?://[a-zA-Z0-9._:/?=&%+#]+\.m3u8[a-zA-Z0-9._:/?=&%+#]*', html)
+            if m3u8_matches:
+                return {
+                    "status": "success",
+                    "stream_url": m3u8_matches[0],
+                    "referer": "https://novahd.cc/",
+                    "origin": "https://novahd.cc"
+                }
+    except Exception as e:
+        print(f"[WARN] NovaHD scrape notice: {e}")
+    return {}
+
+def get_screenscape_direct_stream(media_id: str, is_tv: bool = False, season: int = 1, episode: int = 1) -> dict:
+    api_url = f"https://totu.me/api/hubcloud?tmdb={media_id}" if not is_tv else f"https://totu.me/api/hubcloud?tmdb={media_id}&s={season}&e={episode}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+    try:
+        r = safe_curl_get(api_url, headers=headers, impersonate="chrome120", timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            stream_url = data.get("stream_url") or data.get("url") or (data.get("sources", [{}])[0].get("url") if data.get("sources") else None)
+            if stream_url:
+                return {
+                    "status": "success",
+                    "stream_url": stream_url,
+                    "referer": "https://totu.me/",
+                    "origin": "https://totu.me"
+                }
+    except Exception as e:
+        print(f"[WARN] ScreenScape scrape notice: {e}")
+    return {}
+
+def get_multiaudio_hindi_stream(media_id: str, is_tv: bool = False, season: int = 1, episode: int = 1) -> dict:
+    # 1. Primary: NetMirror Multi-Audio Engine (Native Hindi + Dual/Multi-Audio tracks)
+    data = get_netmirror_direct_stream(media_id, is_tv, season, episode)
+    if data and data.get("stream_url"):
+        return data
+    # 2. Secondary: NovaHD Direct Provider
+    data = get_novahd_direct_stream(media_id, is_tv, season, episode)
+    if data and data.get("stream_url"):
+        return data
+    # 3. Tertiary: ScreenScape HubCloud
+    data = get_screenscape_direct_stream(media_id, is_tv, season, episode)
+    if data and data.get("stream_url"):
+        return data
+    return {}
+
 def get_vidsrc_direct_stream(media_id: str, is_tv: bool = False, season: int = 1, episode: int = 1) -> dict:
     session_obj = curl_requests.Session()
     embed_url = f"https://vidsrc.pm/embed/tv/{media_id}/{season}-{episode}" if is_tv else f"https://vidsrc.pm/embed/movie/{media_id}"
@@ -458,8 +757,9 @@ def get_vidsrc_direct_stream(media_id: str, is_tv: bool = False, season: int = 1
         "x-player-key": "f3b72e73c80c9a996574379798703796a1936efa3516a7105cb0e43048b46b5a"
     }
     try:
-        session_obj.get(embed_url, headers=headers, impersonate="chrome120", timeout=8)
-        r = session_obj.get(api_url, headers=headers, impersonate="chrome120", timeout=8)
+        extra_kwargs = {"impersonate": "chrome120"} if HAS_CURL_CFFI else {}
+        session_obj.get(embed_url, headers=headers, timeout=8, **extra_kwargs)
+        r = session_obj.get(api_url, headers=headers, timeout=8, **extra_kwargs)
         if r.status_code == 200:
             data = r.json()
             if data.get("result") and data.get("sources"):
@@ -483,10 +783,12 @@ def build_sources_tracks_servers(stream: dict, base_server: str, media_type: str
     # 1. Native Direct Streams (100% Native HTML5 Video - Zero Iframes)
     servers = [
         {"id": "1", "name": "⚡ Server 1: Ultra HD Direct (MP4 / Fast Proxy)", "type": "native"},
-        {"id": "2", "name": "🌐 Server 2: Mirror HLS Direct (Scraped Stream)", "type": "native"}
+        {"id": "2", "name": "🌐 Server 2: Mirror HLS Direct (Scraped Stream)", "type": "native"},
+        {"id": "3", "name": "🎧 Server 3: Multi-Audio / Hindi Dubbed (Nova & ScreenScape)", "type": "native"}
     ]
     if not stream:
-        return sources, tracks, servers, total_dur
+        # Allow fallback Server 2 and Server 3 even if Server 1 had no stream
+        pass
 
     # 2. Subtitles with Indian Languages
     captions = stream.get("captions", [])
@@ -584,18 +886,46 @@ def build_sources_tracks_servers(stream: dict, base_server: str, media_type: str
             })
     except Exception as e:
         print(f"[WARN] Mirror stream scrape notice: {e}")
+
+    # 6. Attach Server 3: Multi-Audio / Hindi Dubbed (Nova & ScreenScape)
+    try:
+        multi_data = get_multiaudio_hindi_stream(media_id, is_tv=(media_type == "tv"), season=season, episode=episode)
+        if multi_data and multi_data.get("stream_url"):
+            s_url = multi_data["stream_url"]
+            enc_s = urllib.parse.quote(s_url)
+            ref_param = urllib.parse.quote(multi_data.get("referer", "https://novahd.cc/"))
+            orig_param = urllib.parse.quote(multi_data.get("origin", "https://novahd.cc"))
+            p_multiaudio = f"{base_server}/proxy/m3u8?url={enc_s}&referer={ref_param}&origin={orig_param}"
+            sources.append({
+                "src": p_multiaudio,
+                "type": "application/x-mpegURL",
+                "label": "🎧 Multi-Audio HLS (Hindi / Dual Audio)",
+                "codec": "h264",
+                "isMultiAudio": True,
+                "server": "3"
+            })
+    except Exception as e:
+        print(f"[WARN] Multi-Audio Server 3 scrape notice: {e}")
+
     return sources, tracks, servers, total_dur
 
 @app.get("/api/source/{movie_id}")
 async def api_source_for_videojs(request: Request, movie_id: str):
-    base_server = str(request.base_url).rstrip("/")
+    base_server = get_base_url(request)
+    stream = {}
     try:
         data = await get_movie(movie_id)
-        stream = data.get("stream") if data else None
-        if not stream:
-            return JSONResponse({"status": "error", "message": "No stream found for this movie ID"}, status_code=404)
+        if data and isinstance(data, dict):
+            stream = data.get("stream") or {}
+    except Exception as e:
+        print(f"[WARN] Primary stream get_movie notice: {e}")
+        stream = {}
 
+    try:
         sources, tracks, servers, duration = build_sources_tracks_servers(stream, base_server, "movie", movie_id)
+        if not sources:
+            return JSONResponse({"status": "error", "message": "No stream found for this movie ID across any servers"}, status_code=404)
+
         return {
             "status": "success",
             "type": "movie",
@@ -610,14 +940,21 @@ async def api_source_for_videojs(request: Request, movie_id: str):
 
 @app.get("/api/source/tv/{tv_id}/{season}/{episode}")
 async def api_source_for_tv(request: Request, tv_id: str, season: int, episode: int):
-    base_server = str(request.base_url).rstrip("/")
+    base_server = get_base_url(request)
+    stream = {}
     try:
         data = await get_tv(tv_id, season, episode)
-        stream = data.get("stream") if data else None
-        if not stream:
-            return JSONResponse({"status": "error", "message": "No stream found for this TV episode"}, status_code=404)
+        if data and isinstance(data, dict):
+            stream = data.get("stream") or {}
+    except Exception as e:
+        print(f"[WARN] Primary stream get_tv notice: {e}")
+        stream = {}
 
+    try:
         sources, tracks, servers, duration = build_sources_tracks_servers(stream, base_server, "tv", tv_id, season, episode)
+        if not sources:
+            return JSONResponse({"status": "error", "message": "No stream found for this TV episode across any servers"}, status_code=404)
+
         return {
             "status": "success",
             "type": "tv",
@@ -673,7 +1010,7 @@ async def direct_stream_redirect(request: Request, movie_id: str, lang: str = No
             source_data = await api_source_for_videojs(request, actual_id)
             if isinstance(source_data, dict) and source_data.get("sources"):
                 stream_url = pick_playable_stream(source_data["sources"], codec, transcode)
-                base = str(request.base_url).rstrip("/")
+                base = get_base_url(request)
                 return JSONResponse({
                     "status": "success",
                     "media_id": actual_id,
@@ -717,7 +1054,7 @@ async def direct_stream_tv_redirect(request: Request, tv_id: str, season: int, e
             source_data = await api_source_for_tv(request, tv_id, season, episode)
             if isinstance(source_data, dict) and source_data.get("sources"):
                 stream_url = pick_playable_stream(source_data["sources"], codec, transcode)
-                base = str(request.base_url).rstrip("/")
+                base = get_base_url(request)
                 return JSONResponse({
                     "status": "success",
                     "type": "tv",
@@ -752,11 +1089,12 @@ async def direct_stream_tv_redirect(request: Request, tv_id: str, season: int, e
 @app.get("/api/stream/{movie_id}/{lang}")
 @app.get("/api/stream/{movie_id}")
 async def api_direct_stream_json(request: Request, movie_id: str, lang: str = None):
+    actual_id = movie_id
     target_lang = lang or request.query_params.get("lang")
     source_data = await api_source_for_videojs(request, actual_id)
     if isinstance(source_data, dict) and source_data.get("sources"):
         stream_url = pick_playable_stream(source_data["sources"])
-        base = str(request.base_url).rstrip("/")
+        base = get_base_url(request)
         matching_sub = next((t for t in source_data.get("tracks", []) if target_lang and (target_lang.lower() in t.get("label", "").lower() or target_lang.lower() == t.get("srclang", "").lower())), None)
         return {
             "status": "success",
@@ -792,7 +1130,10 @@ async def proxy_m3u8(request: Request, url: str, referer: str = None, origin: st
         orig = urllib.parse.unquote(origin) if origin else None
         headers = get_upstream_headers(stream_url, ref, orig)
         
-        resp = session.get(stream_url, headers=headers, timeout=12)
+        try:
+            resp = safe_curl_get(stream_url, headers=headers, impersonate="chrome120", timeout=12)
+        except Exception as ce:
+            resp = session.get(stream_url, headers=headers, timeout=12)
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail="Upstream playlist error")
             
@@ -819,6 +1160,14 @@ async def proxy_m3u8(request: Request, url: str, referer: str = None, origin: st
                     enc_target = urllib.parse.quote(target)
                     return f'URI="/proxy/segment?url={enc_target}{extra_params}"'
                 rewritten_lines.append(tag_uri_regex.sub(replace_tag_uri, stripped))
+            elif stripped.startswith("#EXT-X-MEDIA"):
+                def replace_media_uri(match):
+                    target = urllib.parse.urljoin(base_url, match.group(1))
+                    enc_target = urllib.parse.quote(target)
+                    if ".m3u8" in target:
+                        return f'URI="/proxy/m3u8?url={enc_target}{extra_params}"'
+                    return f'URI="/proxy/segment?url={enc_target}{extra_params}"'
+                rewritten_lines.append(tag_uri_regex.sub(replace_media_uri, stripped))
             elif not stripped.startswith("#"):
                 target_url = urllib.parse.urljoin(base_url, stripped)
                 enc_target = urllib.parse.quote(target_url)
@@ -889,11 +1238,13 @@ async def proxy_segment(request: Request, url: str, referer: str = None, origin:
             finally:
                 upstream_resp.close()
 
+        seg_type = "video/mp2t" if (("freecdn" in segment_url and segment_url.endswith(".js")) or segment_url.endswith(".ts")) else upstream_resp.headers.get("Content-Type", "video/mp4")
+        response_headers["Content-Type"] = seg_type
         return StreamingResponse(
             iter_chunks(),
             status_code=upstream_resp.status_code,
             headers=response_headers,
-            media_type=upstream_resp.headers.get("Content-Type", "video/mp4")
+            media_type=seg_type
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Segment error: {e}")
@@ -917,9 +1268,9 @@ async def proxy_h264(request: Request, url: str, referer: str = None, origin: st
                 }
             )
 
-        base_server = str(request.base_url).rstrip("/")
+        port = os.getenv("PORT", "8000")
         enc_target = urllib.parse.quote(segment_url)
-        local_segment_url = f"{base_server}/proxy/segment?url={enc_target}"
+        local_segment_url = f"http://127.0.0.1:{port}/proxy/segment?url={enc_target}"
         if ref:
             local_segment_url += f"&referer={urllib.parse.quote(ref)}"
         if orig:
@@ -992,6 +1343,7 @@ EMBED_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Universal Stream Embed</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1320,7 +1672,9 @@ EMBED_HTML_TEMPLATE = """<!DOCTYPE html>
           <select id="serverSelect" class="player-select" onchange="switchServer(this.value)" title="Stream Source">
             <option value="1">⚡ Server 1: Ultra HD Direct (MP4 / Fast Proxy)</option>
             <option value="2">🌐 Server 2: Mirror HLS Direct (Scraped Stream)</option>
+            <option value="3">🎧 Server 3: Multi-Audio / Hindi Dubbed (Nova & ScreenScape)</option>
           </select>
+          <select id="audioSelect" class="player-select" onchange="onAudioChange(this.value)" title="Audio Track" style="display: none;"></select>
           <select id="qualitySelect" class="player-select" onchange="onQualityChange(this.value)" title="Quality">
             <option value="">Stream Quality</option>
           </select>
@@ -1630,6 +1984,23 @@ EMBED_HTML_TEMPLATE = """<!DOCTYPE html>
         currentSources = data.sources;
         currentTracks = data.tracks || [];
         currentServers = data.servers || [];
+
+        // Mixed-content prevention: upgrade http to https when on https origin
+        if (window.location.protocol === "https:") {
+          currentSources.forEach(s => {
+            if (s.src && s.src.startsWith("http://")) {
+              s.src = s.src.replace(/^http:\/\//i, "https://");
+            }
+          });
+          currentTracks.forEach(t => {
+            if (t.src && t.src.startsWith("http://")) {
+              t.src = t.src.replace(/^http:\/\//i, "https://");
+            }
+            if (t.download_src && t.download_src.startsWith("http://")) {
+              t.download_src = t.download_src.replace(/^http:\/\//i, "https://");
+            }
+          });
+        }
         if (data.duration && data.duration > 0) totalDuration = data.duration;
 
         qualitySelect.innerHTML = '';
@@ -1687,7 +2058,14 @@ EMBED_HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
         function switchServer(serverNum) {
-      if (serverNum === "2") {
+      if (serverNum === "3") {
+        const multiIdx = currentSources.findIndex(s => s.server === "3" || s.isMultiAudio || (s.label && s.label.includes("Multi-Audio")));
+        if (multiIdx !== -1) {
+          playSource(multiIdx);
+        } else {
+          showError("Multi-Audio / Hindi stream is not available for this specific title.");
+        }
+      } else if (serverNum === "2") {
         const mirrorIdx = currentSources.findIndex(s => s.isMirror || (s.label && s.label.includes("Mirror")));
         if (mirrorIdx !== -1) {
           playSource(mirrorIdx);
@@ -1695,12 +2073,54 @@ EMBED_HTML_TEMPLATE = """<!DOCTYPE html>
           playSource(1);
         }
       } else {
-        const primIdx = currentSources.findIndex(s => !s.isMirror);
+        const primIdx = currentSources.findIndex(s => !s.isMirror && !s.isMultiAudio && s.server !== "3");
         if (primIdx !== -1) {
           playSource(primIdx);
         } else {
           playSource(0);
         }
+      }
+    }
+
+    function setupAudioTrackSelector(tracks) {
+      const selectors = [document.getElementById('audioSelect'), document.getElementById('audioSelect2')].filter(Boolean);
+      const audioGroup = document.getElementById('audioGroup');
+      if (!tracks || tracks.length <= 1) {
+        selectors.forEach(sel => sel.style.display = 'none');
+        if (audioGroup) audioGroup.style.display = 'none';
+        return;
+      }
+      selectors.forEach(sel => {
+        sel.innerHTML = '';
+        tracks.forEach((t, idx) => {
+          const opt = document.createElement('option');
+          opt.value = idx;
+          const name = t.name || t.lang || `Track ${idx + 1}`;
+          opt.textContent = `🔊 ${name}`;
+          sel.appendChild(opt);
+        });
+        sel.style.display = 'inline-block';
+        if (hlsInstance) sel.value = hlsInstance.audioTrack;
+      });
+      if (audioGroup) audioGroup.style.display = 'flex';
+
+      // Auto-select Hindi if requested or if Server 3 (Multi-Audio) is active
+      const targetLang = (new URLSearchParams(window.location.search).get('lang') || '').toLowerCase();
+      const curServer = (typeof serverSelect !== 'undefined' && serverSelect ? serverSelect.value : '') || (typeof serverSelect2 !== 'undefined' && serverSelect2 ? serverSelect2.value : '');
+      if (targetLang === 'hindi' || targetLang === 'hi' || curServer === '3') {
+        const hindiIdx = tracks.findIndex(t => (t.name && t.name.toLowerCase().includes('hindi')) || (t.lang && (t.lang.toLowerCase() === 'hi' || t.lang.toLowerCase() === 'hin')));
+        if (hindiIdx !== -1 && hlsInstance) {
+          hlsInstance.audioTrack = hindiIdx;
+          selectors.forEach(sel => sel.value = hindiIdx);
+        }
+      }
+    }
+
+    function onAudioChange(val) {
+      if (hlsInstance) {
+        hlsInstance.audioTrack = parseInt(val, 10);
+        const selectors = [document.getElementById('audioSelect'), document.getElementById('audioSelect2')].filter(Boolean);
+        selectors.forEach(sel => sel.value = val);
       }
     }
 
@@ -1721,7 +2141,13 @@ EMBED_HTML_TEMPLATE = """<!DOCTYPE html>
         hlsInstance = new Hls({ debug: false, enableWorker: true });
         hlsInstance.loadSource(source.src);
         hlsInstance.attachMedia(video);
+        hlsInstance.on(Hls.Events.AUDIO_TRACKS_UPDATED, function(event, data) {
+          setupAudioTrackSelector(data.audioTracks);
+        });
         hlsInstance.on(Hls.Events.MANIFEST_PARSED, function() {
+          if (hlsInstance.audioTracks && hlsInstance.audioTracks.length > 1) {
+            setupAudioTrackSelector(hlsInstance.audioTracks);
+          }
           video.play().catch(() => {});
         });
       } else {
@@ -1796,6 +2222,7 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Universal Stream Player & Subtitle Extractor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -2360,7 +2787,9 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
               <select id="serverSelect" class="player-select" onchange="switchServer(this.value)" title="Stream Source">
             <option value="1">⚡ Server 1: Ultra HD Direct (MP4 / Fast Proxy)</option>
             <option value="2">🌐 Server 2: Mirror HLS Direct (Scraped Stream)</option>
+            <option value="3">🎧 Server 3: Multi-Audio / Hindi Dubbed (Nova & ScreenScape)</option>
           </select>
+          <select id="audioSelect" class="player-select" onchange="onAudioChange(this.value)" title="Audio Track" style="display: none;"></select>
               <select id="qualitySelect" class="player-select" onchange="onQualityChange(this.value)" title="Quality">
                 <option value="">Stream Quality</option>
               </select>
@@ -2384,6 +2813,15 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
         <select id="serverSelect2" class="quality-select" onchange="switchServer(this.value)">
           <option value="1">⚡ Server 1: Ultra HD Direct (MP4 / Fast Proxy)</option>
           <option value="2">🌐 Server 2: Mirror HLS Direct (Scraped Stream)</option>
+          <option value="3">🎧 Server 3: Multi-Audio / Hindi Dubbed (Nova & ScreenScape)</option>
+        </select>
+      </div>
+
+      <!-- Multi-Audio Track Selector -->
+      <div id="audioGroup" class="select-group" style="display: none;">
+        <span style="font-size: 0.88rem; color: var(--text-muted); font-weight: 600;">Audio Language:</span>
+        <select id="audioSelect2" class="quality-select" onchange="onAudioChange(this.value)">
+          <option value="0">Audio: Default</option>
         </select>
       </div>
 
@@ -2782,6 +3220,23 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
         currentSources = data.sources;
         currentTracks = data.tracks || [];
         currentServers = data.servers || [];
+
+        // Mixed-content prevention: upgrade http to https when on https origin
+        if (window.location.protocol === "https:") {
+          currentSources.forEach(s => {
+            if (s.src && s.src.startsWith("http://")) {
+              s.src = s.src.replace(/^http:\/\//i, "https://");
+            }
+          });
+          currentTracks.forEach(t => {
+            if (t.src && t.src.startsWith("http://")) {
+              t.src = t.src.replace(/^http:\/\//i, "https://");
+            }
+            if (t.download_src && t.download_src.startsWith("http://")) {
+              t.download_src = t.download_src.replace(/^http:\/\//i, "https://");
+            }
+          });
+        }
         if (data.duration && data.duration > 0) totalDuration = data.duration;
 
         // Quality Selectors (both on-player and below-player)
@@ -2891,7 +3346,13 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
         hlsInstance = new Hls({ debug: false, enableWorker: true });
         hlsInstance.loadSource(source.src);
         hlsInstance.attachMedia(video);
+        hlsInstance.on(Hls.Events.AUDIO_TRACKS_UPDATED, function(event, data) {
+          setupAudioTrackSelector(data.audioTracks);
+        });
         hlsInstance.on(Hls.Events.MANIFEST_PARSED, function() {
+          if (hlsInstance.audioTracks && hlsInstance.audioTracks.length > 1) {
+            setupAudioTrackSelector(hlsInstance.audioTracks);
+          }
           video.play().catch(() => {});
         });
       } else {
@@ -2902,7 +3363,14 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
         function switchServer(serverNum) {
-      if (serverNum === "2") {
+      if (serverNum === "3") {
+        const multiIdx = currentSources.findIndex(s => s.server === "3" || s.isMultiAudio || (s.label && s.label.includes("Multi-Audio")));
+        if (multiIdx !== -1) {
+          playSource(multiIdx);
+        } else {
+          showError("Multi-Audio / Hindi stream is not available for this specific title.");
+        }
+      } else if (serverNum === "2") {
         const mirrorIdx = currentSources.findIndex(s => s.isMirror || (s.label && s.label.includes("Mirror")));
         if (mirrorIdx !== -1) {
           playSource(mirrorIdx);
@@ -2910,12 +3378,54 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
           playSource(1);
         }
       } else {
-        const primIdx = currentSources.findIndex(s => !s.isMirror);
+        const primIdx = currentSources.findIndex(s => !s.isMirror && !s.isMultiAudio && s.server !== "3");
         if (primIdx !== -1) {
           playSource(primIdx);
         } else {
           playSource(0);
         }
+      }
+    }
+
+    function setupAudioTrackSelector(tracks) {
+      const selectors = [document.getElementById('audioSelect'), document.getElementById('audioSelect2')].filter(Boolean);
+      const audioGroup = document.getElementById('audioGroup');
+      if (!tracks || tracks.length <= 1) {
+        selectors.forEach(sel => sel.style.display = 'none');
+        if (audioGroup) audioGroup.style.display = 'none';
+        return;
+      }
+      selectors.forEach(sel => {
+        sel.innerHTML = '';
+        tracks.forEach((t, idx) => {
+          const opt = document.createElement('option');
+          opt.value = idx;
+          const name = t.name || t.lang || `Track ${idx + 1}`;
+          opt.textContent = `🔊 ${name}`;
+          sel.appendChild(opt);
+        });
+        sel.style.display = 'inline-block';
+        if (hlsInstance) sel.value = hlsInstance.audioTrack;
+      });
+      if (audioGroup) audioGroup.style.display = 'flex';
+
+      // Auto-select Hindi if requested or if Server 3 (Multi-Audio) is active
+      const targetLang = (new URLSearchParams(window.location.search).get('lang') || '').toLowerCase();
+      const curServer = (typeof serverSelect !== 'undefined' && serverSelect ? serverSelect.value : '') || (typeof serverSelect2 !== 'undefined' && serverSelect2 ? serverSelect2.value : '');
+      if (targetLang === 'hindi' || targetLang === 'hi' || curServer === '3') {
+        const hindiIdx = tracks.findIndex(t => (t.name && t.name.toLowerCase().includes('hindi')) || (t.lang && (t.lang.toLowerCase() === 'hi' || t.lang.toLowerCase() === 'hin')));
+        if (hindiIdx !== -1 && hlsInstance) {
+          hlsInstance.audioTrack = hindiIdx;
+          selectors.forEach(sel => sel.value = hindiIdx);
+        }
+      }
+    }
+
+    function onAudioChange(val) {
+      if (hlsInstance) {
+        hlsInstance.audioTrack = parseInt(val, 10);
+        const selectors = [document.getElementById('audioSelect'), document.getElementById('audioSelect2')].filter(Boolean);
+        selectors.forEach(sel => sel.value = val);
       }
     }
 
@@ -3051,4 +3561,4 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     print(f"[SERVER START] Running on http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips="*")
