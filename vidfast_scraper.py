@@ -36,7 +36,7 @@ def safe_curl_get(url, **kwargs):
         kwargs.pop("impersonate", None)
         return requests.get(url, **kwargs)
     try:
-        return safe_curl_get(url, **kwargs)
+        return curl_requests.get(url, **kwargs)
     except TypeError:
         kwargs.pop("impersonate", None)
         return requests.get(url, **kwargs)
@@ -139,6 +139,22 @@ def get_upstream_headers(target_url: str, referer: str = None, origin: str = Non
     elif "filmboom" in (referer or "") or "bcdnxw" in target_url:
         headers["Referer"] = referer or "https://filmboom.top/"
         headers["Origin"] = origin or "https://filmboom.top"
+    elif "workers.dev" in target_url or "finalsignal" in target_url:
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        headers["Referer"] = referer or "https://vidsrc.pm/"
+        headers["Origin"] = origin or "https://vidsrc.pm"
+        if "data=" in target_url:
+            try:
+                raw_data = urllib.parse.parse_qs(urllib.parse.urlparse(target_url).query).get("data", [""])[0]
+                if raw_data:
+                    decoded_data = base64.b64decode(raw_data).decode("utf-8", errors="ignore")
+                    for part in decoded_data.split("|"):
+                        if part.startswith("Origin="):
+                            headers["Origin"] = part.split("=", 1)[1]
+                        elif part.startswith("Referer="):
+                            headers["Referer"] = part.split("=", 1)[1]
+            except Exception:
+                pass
     elif referer:
         headers["Referer"] = referer
         if origin:
@@ -1184,6 +1200,8 @@ async def proxy_m3u8(request: Request, url: str, referer: str = None, origin: st
             media_type="application/vnd.apple.mpegurl",
             headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Proxy m3u8 error: {e}")
 
@@ -2149,6 +2167,18 @@ EMBED_HTML_TEMPLATE = """<!DOCTYPE html>
             setupAudioTrackSelector(hlsInstance.audioTracks);
           }
           video.play().catch(() => {});
+        });
+        hlsInstance.on(Hls.Events.ERROR, function(event, data) {
+          if (data && data.fatal) {
+            console.warn("HLS fatal error on source", currentSourceIdx, data);
+            if (currentSources.length > 1 && currentSourceIdx + 1 < currentSources.length) {
+              const nextIdx = currentSourceIdx + 1;
+              console.log("Failing over automatically to source:", nextIdx);
+              playSource(nextIdx);
+            } else {
+              showError("Stream connection interrupted. Try switching servers from the dropdown.");
+            }
+          }
         });
       } else {
         video.src = source.src;
@@ -3354,6 +3384,18 @@ PLAYER_HTML_TEMPLATE = """<!DOCTYPE html>
             setupAudioTrackSelector(hlsInstance.audioTracks);
           }
           video.play().catch(() => {});
+        });
+        hlsInstance.on(Hls.Events.ERROR, function(event, data) {
+          if (data && data.fatal) {
+            console.warn("HLS fatal error on source", currentSourceIdx, data);
+            if (currentSources.length > 1 && currentSourceIdx + 1 < currentSources.length) {
+              const nextIdx = currentSourceIdx + 1;
+              console.log("Failing over automatically to source:", nextIdx);
+              playSource(nextIdx);
+            } else {
+              showError("Stream connection interrupted. Try switching servers from the dropdown.");
+            }
+          }
         });
       } else {
         video.src = source.src;
